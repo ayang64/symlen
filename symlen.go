@@ -7,14 +7,18 @@ import (
 	"go/parser"
 	"go/token"
 	"log"
+	"path"
+	"runtime"
 	"unicode/utf8"
 )
 
 type Accumulator struct {
+	Name  string
 	Total uint64
 	Count uint64
 	Min   uint64
 	Max   uint64
+	MaxID string
 }
 
 func (a *Accumulator) Visit(node ast.Node) ast.Visitor {
@@ -37,42 +41,82 @@ func (a *Accumulator) Visit(node ast.Node) ast.Visitor {
 	}
 
 	switch n := node.(type) {
+
 	case *ast.Ident:
 		l := uint64(utf8.RuneCountInString(n.Name))
 		a.Count++
 		a.Total += l
 		a.Min = min(l, a.Min)
-		a.Max = max(l, a.Max)
+
+		// while we're testing if we've exceded our prior max, also stash the name
+		// of the longest identifier.
+		m := max(l, a.Max)
+		if m != a.Max {
+			a.MaxID = n.Name
+		}
+		a.Max = m
 	}
 	return a
 }
 
-func count(p string) error {
+func (a *Accumulator) String() string {
+	return fmt.Sprintf("%-5.5s: identifiers: %-5d total: %-5d average: %-5.5f min: %-5d max: %-5d (%q)", path.Base(a.Name), a.Count, a.Total, float64(a.Total)/float64(a.Count), a.Min, a.Max, a.MaxID)
+}
+
+func count(p string) (*Accumulator, error) {
 	fs := token.NewFileSet()
 	pkgs, err := parser.ParseDir(fs, p, nil, 0)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	a := &Accumulator{
-		Min: ^uint64(0),
+		Min:  ^uint64(0),
+		Name: p,
 	}
 
 	for _, t := range pkgs {
 		ast.Walk(a, t)
 	}
 
-	fmt.Printf("identifiers: %d, total: %d, min: %d, max: %d,  average: %f\n", a.Count, a.Total, a.Min, a.Max, float64(a.Total)/float64(a.Count))
-	return nil
+	return a, nil
 }
 
 func main() {
-	// yes, i know -- there are no flags yet.
+	j := flag.Int("j", runtime.NumCPU()*16, "maximum number of concurrent counters")
 	flag.Parse()
 
-	for _, arg := range flag.Args() {
-		if err := count(arg); err != nil {
-			log.Fatal(err)
+	ach := make(chan *Accumulator, *j)
+
+	go func() {
+		// used to clamp concurrent operations to *j
+		sem := make(chan struct{}, *j)
+
+		for _, arg := range flag.Args() {
+			arg := arg
+
+			sem <- struct{}{}
+			go func() {
+				acc, err := count(arg)
+				if err != nil {
+					log.Print(err)
+				}
+				ach <- acc
+
+				<-sem
+			}()
 		}
+
+		// drain worker queue
+		for i := 0; i < cap(sem); i++ {
+			sem <- struct{}{}
+		}
+
+		close(ach)
+	}()
+
+	// read results from ach and print each to the terminal
+	for a := range ach {
+		fmt.Printf("%s\n", a)
 	}
 }
